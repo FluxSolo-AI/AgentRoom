@@ -1,0 +1,21 @@
+{
+  "name": "fluxroom",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build -w @fluxroom/shared && concurrently \"npm run dev:room\" \"npm run dev:orch\" \"npm run dev:web\"",
+    "dev:room": "npm run dev -w @fluxroom/room-service",
+    "dev:orch": "npm run dev -w @fluxroom/orchestrator",
+    "dev:web": "npm run dev -w @fluxroom/web",
+    "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator",
+    "test": "npm test -w @fluxroom/shared",
+    "setup": "docker-compose up -d"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.0"
+  }
+}
