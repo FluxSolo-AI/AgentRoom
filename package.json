@@ -12,9 +12,12 @@
     "dev:agents": "npm run dev -w @fluxroom/agent-runtime",
     "dev:web": "npm run dev -w @fluxroom/web",
     "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator && npm run build -w @fluxroom/agent-runtime",
+    "build:web": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/web",
     "test": "npm test -w @fluxroom/shared",
     "demo": "tsx scripts/demo.ts",
-    "setup": "docker-compose up -d"
+    "setup": "docker-compose up -d",
+    "lint": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

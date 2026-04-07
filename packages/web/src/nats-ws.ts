@@ -7,9 +7,12 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
-import { parse } from 'url';
+import { IncomingMessage } from 'http';
 
 const PORT = Number(process.env.WS_PORT) || 8080;
+
+// Allowed origins for WebSocket connections (configurable via environment)
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',');
 
 // Room subscriptions for each client
 const clientSubscriptions = new Map<WebSocket, Set<string>>();
@@ -18,9 +21,18 @@ const server = createServer();
 const wss = new WebSocketServer({ server });
 
 console.log(`[WebSocket Server] Starting on port ${PORT}...`);
+console.log(`[WebSocket Server] Allowed origins: ${allowedOrigins.join(', ')}`);
 
-wss.on('connection', (ws: WebSocket) => {
-  console.log('[WebSocket Server] Client connected');
+wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+  // Validate origin for security
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    console.log(`[WebSocket Server] Rejected connection from: ${origin}`);
+    ws.close(1008, 'Origin not allowed');
+    return;
+  }
+
+  console.log('[WebSocket Server] Client connected from:', origin || 'unknown');
   clientSubscriptions.set(ws, new Set());
 
   ws.on('message', (data: Buffer) => {
@@ -46,10 +58,16 @@ function handleMessage(ws: WebSocket, message: any) {
   const subscriptions = clientSubscriptions.get(ws);
   if (!subscriptions) return;
 
+  // Validate message structure
+  if (!message || typeof message !== 'object') {
+    console.log('[WebSocket Server] Invalid message format');
+    return;
+  }
+
   switch (message.type) {
     case 'subscribe':
       // Subscribe to room events
-      if (message.roomId) {
+      if (message.roomId && typeof message.roomId === 'string') {
         subscriptions.add(`room.${message.roomId}.#`);
         console.log(`[WebSocket Server] Client subscribed to room: ${message.roomId}`);
         ws.send(JSON.stringify({
@@ -61,7 +79,7 @@ function handleMessage(ws: WebSocket, message: any) {
 
     case 'unsubscribe':
       // Unsubscribe from room
-      if (message.roomId) {
+      if (message.roomId && typeof message.roomId === 'string') {
         subscriptions.delete(`room.${message.roomId}.#`);
         console.log(`[WebSocket Server] Client unsubscribed from room: ${message.roomId}`);
       }
@@ -102,6 +120,13 @@ server.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('[WebSocket Server] Shutting down...');
+  wss.close();
+  server.close();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('[WebSocket Server] Received SIGTERM, shutting down...');
   wss.close();
   server.close();
   process.exit(0);
