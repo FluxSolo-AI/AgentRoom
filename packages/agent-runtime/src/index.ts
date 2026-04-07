@@ -35,6 +35,7 @@ import {
   globalContextManager,
   PolicyEngine,
   globalPolicyEngine,
+  BaseTool,
 } from '@fluxroom/shared';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -130,7 +131,8 @@ export abstract class ToolAwareAgent {
         // In production, this would trigger a human intervention
         // For now, we log and continue
       } else {
-        this.logger.error('Tool execution denied by policy', { toolId, rule: policyResult.matchedRule?.name });
+        const policyError = new Error(`Policy denied: ${policyResult.reason}`);
+        this.logger.error('Tool execution denied by policy', policyError, { toolId, rule: policyResult.matchedRule?.name });
         return {
           success: false,
           error: `Policy denied: ${policyResult.reason}`,
@@ -166,18 +168,28 @@ export abstract class ToolAwareAgent {
 
   private async subscribeToCommands(): Promise<void> {
     // Subscribe to commands for this agent type (broadcast)
-    await this.nc.subscribe(
+    const sub1 = this.nc.subscribe(
       AgentSubjects.command(this.agentType),
-      { queue: QueueGroups.agentRuntime(this.agentType) },
-      (msg: Msg) => this.handleCommand(msg)
+      { queue: QueueGroups.agentRuntime(this.agentType) }
     );
     
     // Subscribe to direct commands for this agent instance
-    await this.nc.subscribe(
-      AgentSubjects.agentCommand(this.agentId),
-      {},
-      (msg: Msg) => this.handleCommand(msg)
+    const sub2 = this.nc.subscribe(
+      AgentSubjects.agentCommand(this.agentId)
     );
+
+    // Process messages
+    (async () => {
+      for await (const msg of sub1) {
+        await this.handleCommand(msg);
+      }
+    })();
+
+    (async () => {
+      for await (const msg of sub2) {
+        await this.handleCommand(msg);
+      }
+    })();
 
     this.logger.debug('Subscribed to commands', { agentType: this.agentType, agentId: this.agentId });
   }
@@ -259,7 +271,7 @@ export abstract class ToolAwareAgent {
         await this.sleep(1000 + Math.random() * 2000);
         
         // Check if cancelled
-        if (this.status === 'idle') {
+        if ((this.status as string) === 'idle') {
           this.logger.info('Task was cancelled', { taskId });
           return;
         }
@@ -351,9 +363,9 @@ export abstract class ToolAwareAgent {
   protected async planExecution(goal: string, priority: string): Promise<ExecutionStep[]> {
     // Default implementation - subclasses can override with tool usage
     return [
-      { description: `Analyzing: ${goal}`, tool?: undefined, params?: {} },
-      { description: 'Executing plan', tool?: undefined, params?: {} },
-      { description: 'Finalizing', tool?: undefined, params?: {} },
+      { description: `Analyzing: ${goal}` },
+      { description: 'Executing plan' },
+      { description: 'Finalizing' },
     ];
   }
 
@@ -451,6 +463,34 @@ interface ExecutionStep {
 // Planner Agent (with tools)
 // ============================================================
 
+// Analysis tool for planner
+class AnalyzeTaskTool extends BaseTool {
+  readonly definition = {
+    id: 'planner.analyze',
+    name: 'analyze_task',
+    description: 'Analyze a task and break it down',
+    category: 'code' as const,
+    parameters: [
+      { name: 'goal', type: 'string' as const, description: 'Task goal', required: true },
+      { name: 'priority', type: 'string' as const, description: 'Task priority', required: false },
+    ],
+    returns: { type: 'object', description: 'Analysis result' },
+  };
+
+  async execute(params: Record<string, unknown>) {
+    const startTime = Date.now();
+    return {
+      success: true,
+      data: {
+        subtasks: ['Subtask 1', 'Subtask 2', 'Subtask 3'],
+        estimatedTime: '30 minutes',
+        complexity: 'medium',
+      },
+      executionTime: Date.now() - startTime,
+    };
+  }
+}
+
 class PlannerAgent extends ToolAwareAgent {
   constructor(nc: NatsConnection) {
     super(nc, `planner-${uuidv4().slice(0, 6)}`, 'planner');
@@ -458,31 +498,7 @@ class PlannerAgent extends ToolAwareAgent {
 
   protected registerTools(): void {
     // Planner has access to analysis tools
-    this.tools.register(new (class {
-      readonly definition = {
-        id: 'planner.analyze',
-        name: 'analyze_task',
-        description: 'Analyze a task and break it down',
-        category: 'code' as const,
-        parameters: [
-          { name: 'goal', type: 'string', description: 'Task goal', required: true },
-          { name: 'priority', type: 'string', description: 'Task priority', required: false },
-        ],
-        returns: { type: 'object', description: 'Analysis result' },
-      };
-
-      async execute(params: Record<string, unknown>) {
-        return {
-          success: true,
-          data: {
-            subtasks: ['Subtask 1', 'Subtask 2', 'Subtask 3'],
-            estimatedTime: '30 minutes',
-            complexity: 'medium',
-          },
-        };
-      }
-    })());
-
+    this.tools.register(new AnalyzeTaskTool());
     this.logger.debug('Planner tools registered');
   }
 

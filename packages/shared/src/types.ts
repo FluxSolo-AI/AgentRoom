@@ -104,19 +104,3 @@ export interface AgentInfo {
   capabilities: string[];
   maxConcurrentTasks: number;
 }
-
-// Policy Types
-export interface Policy {
-  id: string;
-  name: string;
-  description: string;
-  rules: PolicyRule[];
-  createdAt: string;
-}
-
-export interface PolicyRule {
-  id: string;
-  condition: string;
-  action: 'allow' | 'deny' | 'require_human_approval';
-  priority: number;
-}

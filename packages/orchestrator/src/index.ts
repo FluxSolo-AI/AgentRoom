@@ -67,7 +67,7 @@ export class OrchestratorService {
   private config: OrchestratorConfig;
   private logger;
   private persistence?: PersistenceService;
-  private subscriptions: Msg[] = [];
+  private subscriptions: any[] = [];
 
   constructor(
     nc: NatsConnection, 

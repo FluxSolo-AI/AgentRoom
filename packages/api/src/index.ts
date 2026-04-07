@@ -57,7 +57,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 interface ServiceHealth {
   name: string;
-  status: 'healthy' | 'unhealthy' | 'unknown';
+  status: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
   latency?: number;
   error?: string;
 }

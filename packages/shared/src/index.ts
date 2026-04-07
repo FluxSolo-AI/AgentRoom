@@ -15,8 +15,9 @@ export * from './validation';
 // Logging
 export * from './logger';
 
-// Persistence
-export * from './persistence';
+// Persistence (re-export types only)
+export { PersistenceService, StreamNames, createPersistenceService } from './persistence';
+export type { EventEnvelope } from './persistence';
 
 // Tool System
 export * from './tools';

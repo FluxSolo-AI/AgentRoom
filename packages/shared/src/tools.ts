@@ -83,7 +83,15 @@ export abstract class BaseTool {
   protected status: ToolStatus = 'available';
 
   constructor(logger?: Logger) {
-    this.logger = logger || createLogger(`tool:${this.definition.name}`);
+    // Note: logger name will be refined after definition is set
+    this.logger = logger || createLogger('tool');
+  }
+
+  // Helper to get logger with proper name after construction
+  protected initLogger(name: string): void {
+    if (!this.logger || this.logger === createLogger('tool')) {
+      this.logger = createLogger(`tool:${name}`);
+    }
   }
 
   abstract execute(params: Record<string, unknown>): Promise<ToolResult>;
@@ -469,6 +477,7 @@ export class ReadFileTool extends BaseTool {
 
   async execute(params: Record<string, unknown>): Promise<ToolResult<string>> {
     const { path, encoding = 'utf8' } = params;
+    const startTime = Date.now();
 
     try {
       // In production, this would use fs.promises
@@ -478,11 +487,13 @@ export class ReadFileTool extends BaseTool {
       return {
         success: true,
         data: `[Mock content of ${path}]`,
+        executionTime: Date.now() - startTime,
       };
     } catch (error) {
       return {
         success: false,
         error: (error as Error).message,
+        executionTime: Date.now() - startTime,
       };
     }
   }
@@ -493,6 +504,7 @@ export class HttpRequestTool extends BaseTool {
 
   async execute(params: Record<string, unknown>): Promise<ToolResult> {
     const { url, method = 'GET', headers, body } = params;
+    const startTime = Date.now();
 
     try {
       this.logger.debug('Making HTTP request', { url, method });
@@ -506,11 +518,13 @@ export class HttpRequestTool extends BaseTool {
           headers: { 'content-type': 'application/json' },
           body: { message: 'OK' },
         },
+        executionTime: Date.now() - startTime,
       };
     } catch (error) {
       return {
         success: false,
         error: (error as Error).message,
+        executionTime: Date.now() - startTime,
       };
     }
   }
@@ -521,6 +535,7 @@ export class RunCommandTool extends BaseTool {
 
   async execute(params: Record<string, unknown>): Promise<ToolResult> {
     const { command, cwd, timeout = 30000 } = params;
+    const startTime = Date.now();
 
     this.logger.info('Running command', { command, cwd, timeout });
 
@@ -533,6 +548,7 @@ export class RunCommandTool extends BaseTool {
         stderr: '',
         exitCode: 0,
       },
+      executionTime: Date.now() - startTime,
     };
   }
 }
