@@ -6,16 +6,19 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run build -w @fluxroom/shared && concurrently \"npm run dev:room\" \"npm run dev:orch\" \"npm run dev:web\"",
+    "dev": "npm run build -w @fluxroom/shared && concurrently \"npm run dev:room\" \"npm run dev:orch\" \"npm run dev:agents\" \"npm run dev:web\"",
     "dev:room": "npm run dev -w @fluxroom/room-service",
     "dev:orch": "npm run dev -w @fluxroom/orchestrator",
+    "dev:agents": "npm run dev -w @fluxroom/agent-runtime",
     "dev:web": "npm run dev -w @fluxroom/web",
-    "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator",
+    "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator && npm run build -w @fluxroom/agent-runtime",
     "test": "npm test -w @fluxroom/shared",
+    "demo": "tsx scripts/demo.ts",
     "setup": "docker-compose up -d"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
+    "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   }
 }
