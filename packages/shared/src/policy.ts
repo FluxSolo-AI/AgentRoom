@@ -100,7 +100,7 @@ export const DefaultPolicies: Omit<PolicyRule, 'id' | 'createdAt' | 'updatedAt'>
     description: 'Critical priority tasks require human approval',
     effect: 'require_human_approval',
     subjects: ['task'],
-    actions: ['execute'],
+    actions: ['execute', 'create'],
     conditions: [
       { field: 'task.priority', operator: 'equals', value: 'critical' },
     ],
@@ -344,6 +344,12 @@ export class PolicyEngine {
   }
 
   private getNestedValue(obj: Record<string, unknown>, path: string): unknown {
+    // First, check if the key exists as-is (for flat keys like 'tool.category')
+    if (path in obj) {
+      return obj[path];
+    }
+    
+    // Then try nested access
     return path.split('.').reduce((current: unknown, key: string) => {
       if (current && typeof current === 'object') {
         return (current as Record<string, unknown>)[key];

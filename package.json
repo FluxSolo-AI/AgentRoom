@@ -14,17 +14,20 @@
     "dev:api": "npm run dev -w @fluxroom/api",
     "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator && npm run build -w @fluxroom/agent-runtime && npm run build -w @fluxroom/api",
     "build:web": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/web",
-    "test": "npm test -w @fluxroom/shared",
+    "test": "vitest",
     "demo": "tsx scripts/demo.ts",
     "setup": "docker-compose up -d",
     "lint": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test:run": "vitest run"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/node": "^25.5.2",
     "concurrently": "^8.2.2",
     "tsx": "^4.7.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.3"
   }
 }

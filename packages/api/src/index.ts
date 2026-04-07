@@ -5,6 +5,7 @@
  * - RESTful endpoints for room, task, and intervention management
  * - Health check endpoints for monitoring
  * - Webhook support for external integrations
+ * - Rate limiting for protection against abuse
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -21,12 +22,64 @@ const LOG_FORMAT = process.env.NODE_ENV === 'production' ? 'json' : 'console';
 const logger = createLogger('api', { format: LOG_FORMAT as 'console' | 'json' });
 
 // ============================================================
+// Rate Limiting (Simple in-memory implementation)
+// ============================================================
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimitMap = new Map<string, RateLimitEntry>();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 100; // requests per window
+
+function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  
+  let entry = rateLimitMap.get(ip);
+  
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
+    rateLimitMap.set(ip, entry);
+  }
+  
+  entry.count++;
+  
+  // Set rate limit headers
+  res.setHeader('X-RateLimit-Limit', RATE_LIMIT_MAX.toString());
+  res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_LIMIT_MAX - entry.count).toString());
+  res.setHeader('X-RateLimit-Reset', Math.ceil(entry.resetAt / 1000).toString());
+  
+  if (entry.count > RATE_LIMIT_MAX) {
+    res.status(429).json({ error: 'Too many requests, please try again later.' });
+    return;
+  }
+  
+  next();
+}
+
+// Cleanup old entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap.entries()) {
+    if (now >= entry.resetAt) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 60000); // Clean up every minute
+
+// ============================================================
 // Express App
 // ============================================================
 
 const app = express();
 
-// Middleware
+// Apply rate limiting
+app.use(rateLimitMiddleware);
+
+// CORS
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
   credentials: true,
@@ -267,7 +320,7 @@ app.get('/api/tasks/:taskId', (req: Request, res: Response) => {
   res.json({ task });
 });
 
-app.patch('/api/tasks/:taskId', (req: Request, res: Response) => {
+ app.patch('/api/tasks/:taskId', (req: Request, res: Response) => {
   const { taskId } = req.params;
   const { status, assignedTo } = req.body;
   
