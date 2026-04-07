@@ -27,3 +27,6 @@ export * from './context';
 
 // Policy Engine
 export * from './policy';
+
+// Circuit Breaker
+export * from './circuit-breaker';
