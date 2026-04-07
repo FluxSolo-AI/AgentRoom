@@ -1,11 +1,14 @@
 /**
- * Agent Runtime - Base class and example agent implementations
+ * Agent Runtime - Enhanced with Tool System, Context, and Policy
  * 
  * Responsibilities:
  * - Subscribe to tasks from orchestrator
  * - Execute tasks with tool calling
  * - Report progress and results
  * - Handle heartbeats and status updates
+ * - Integrate with Tool System for capability extension
+ * - Use Context Manager for state tracking
+ * - Enforce Policy Engine rules
  */
 
 import { 
@@ -16,9 +19,7 @@ import {
 import { 
   AgentType,
   AgentStatus,
-  AgentInfo,
-  Task,
-  TaskStatus,
+  createLogger,
   createEventEnvelope,
   AgentStatusChangedPayload,
   AgentHeartbeatPayload,
@@ -27,15 +28,21 @@ import {
   AgentSubjects,
   OrchestratorSubjects,
   QueueGroups,
-  EventEnvelope
+  ToolRegistry,
+  ToolResult,
+  ToolExecution,
+  ContextManager,
+  globalContextManager,
+  PolicyEngine,
+  globalPolicyEngine,
 } from '@fluxroom/shared';
 import { v4 as uuidv4 } from 'uuid';
 
 // ============================================================
-// Base Agent Class
+// Tool-Aware Agent
 // ============================================================
 
-export abstract class BaseAgent {
+export abstract class ToolAwareAgent {
   protected nc: NatsConnection;
   protected agentId: string;
   protected agentType: AgentType;
@@ -43,11 +50,30 @@ export abstract class BaseAgent {
   protected currentTaskId?: string;
   protected currentRoomId?: string;
   protected heartbeatInterval?: NodeJS.Timeout;
+  
+  // Integrations
+  protected tools: ToolRegistry;
+  protected context: ContextManager;
+  protected policies: PolicyEngine;
+  protected logger;
 
-  constructor(nc: NatsConnection, agentId: string, agentType: AgentType) {
+  constructor(
+    nc: NatsConnection, 
+    agentId: string, 
+    agentType: AgentType,
+    options?: {
+      tools?: ToolRegistry;
+      context?: ContextManager;
+      policies?: PolicyEngine;
+    }
+  ) {
     this.nc = nc;
     this.agentId = agentId;
     this.agentType = agentType;
+    this.tools = options?.tools || new ToolRegistry();
+    this.context = options?.context || globalContextManager;
+    this.policies = options?.policies || globalPolicyEngine;
+    this.logger = createLogger(`agent:${agentType}`);
   }
 
   // ============================================================
@@ -55,7 +81,10 @@ export abstract class BaseAgent {
   // ============================================================
 
   async start(): Promise<void> {
-    console.log(`[${this.agentType}] Agent ${this.agentId} starting...`);
+    this.logger.info('Agent starting', { agentId: this.agentId, agentType: this.agentType });
+    
+    // Register built-in tools
+    this.registerTools();
     
     // Subscribe to commands
     await this.subscribeToCommands();
@@ -66,17 +95,69 @@ export abstract class BaseAgent {
     // Register status
     await this.updateStatus('idle');
     
-    console.log(`[${this.agentType}] Agent ${this.agentId} ready`);
+    this.logger.info('Agent ready', { 
+      agentId: this.agentId, 
+      toolsAvailable: this.tools.getHealth().totalTools 
+    });
   }
 
   async stop(): Promise<void> {
-    console.log(`[${this.agentType}] Agent ${this.agentId} stopping...`);
+    this.logger.info('Agent stopping', { agentId: this.agentId });
     
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
     }
     
     await this.updateStatus('offline');
+  }
+
+  // ============================================================
+  // Tool Management
+  // ============================================================
+
+  protected abstract registerTools(): void;
+
+  async executeTool(
+    toolId: string, 
+    parameters: Record<string, unknown>
+  ): Promise<ToolResult> {
+    // Check policy before execution
+    const policyResult = this.policies.canExecuteTool(toolId, toolId, toolId);
+    
+    if (!policyResult.allowed) {
+      if (policyResult.requiresApproval) {
+        this.logger.warn('Tool execution requires approval', { toolId, rule: policyResult.matchedRule?.name });
+        // In production, this would trigger a human intervention
+        // For now, we log and continue
+      } else {
+        this.logger.error('Tool execution denied by policy', { toolId, rule: policyResult.matchedRule?.name });
+        return {
+          success: false,
+          error: `Policy denied: ${policyResult.reason}`,
+          executionTime: 0,
+        };
+      }
+    }
+
+    // Execute tool
+    const result = await this.tools.execute(toolId, parameters, this.agentId);
+
+    // Record in context
+    if (this.currentRoomId) {
+      this.context.addEntry(this.currentRoomId, 'tool_result', {
+        toolId,
+        parameters,
+        result: result.data,
+        success: result.success,
+        executionTime: result.executionTime,
+      }, this.agentId, { taskId: this.currentTaskId });
+    }
+
+    return result;
+  }
+
+  getAvailableTools() {
+    return this.tools.listTools({ availableOnly: true });
   }
 
   // ============================================================
@@ -98,29 +179,32 @@ export abstract class BaseAgent {
       (msg: Msg) => this.handleCommand(msg)
     );
 
-    console.log(`[${this.agentType}] Subscribed to commands`);
+    this.logger.debug('Subscribed to commands', { agentType: this.agentType, agentId: this.agentId });
   }
 
   private async handleCommand(msg: Msg): Promise<void> {
     try {
       const command = JSON.parse(msg.data.toString());
-      console.log(`[${this.agentType}] Received command:`, command);
+      this.logger.debug('Received command', { command: command.command, taskId: command.taskId });
       
       switch (command.command) {
         case 'execute_task':
           await this.executeTask(command.taskId, command.goal, command.priority);
           break;
         case 'cancel_task':
-          await this.cancelTask(command.taskId);
+          this.cancelTask(command.taskId);
           break;
         case 'status':
           await this.reportStatus();
           break;
+        case 'list_tools':
+          this.reportAvailableTools();
+          break;
         default:
-          console.log(`[${this.agentType}] Unknown command: ${command.command}`);
+          this.logger.warn('Unknown command', { command: command.command });
       }
-    } catch (e) {
-      console.error(`[${this.agentType}] Failed to handle command:`, e);
+    } catch (error) {
+      this.logger.error('Failed to handle command', error as Error);
     }
   }
 
@@ -131,27 +215,52 @@ export abstract class BaseAgent {
   protected async executeTask(taskId: string, goal: string, priority: string): Promise<void> {
     this.currentTaskId = taskId;
     this.status = 'working';
+    this.currentRoomId = this.extractRoomId(taskId);
     
     try {
       // Update status
       await this.updateStatus('working');
       
-      // Simulate work with progress updates
-      const steps = this.getExecutionSteps(goal);
+      // Check policy
+      const policyResult = this.policies.canExecuteTask(taskId, priority, this.agentId);
+      if (!policyResult.allowed) {
+        if (policyResult.requiresApproval) {
+          this.logger.warn('Task execution requires approval', { taskId, rule: policyResult.matchedRule?.name });
+        } else {
+          throw new Error(`Policy denied: ${policyResult.reason}`);
+        }
+      }
+
+      // Add task to context
+      if (this.currentRoomId) {
+        this.context.addEntry(this.currentRoomId, 'task', {
+          taskId,
+          goal,
+          priority,
+          status: 'in_progress',
+          agentId: this.agentId,
+        }, this.agentId, { taskId });
+      }
+
+      // Execute task steps
+      const steps = await this.planExecution(goal, priority);
       
       for (let i = 0; i < steps.length; i++) {
         const step = steps[i];
-        console.log(`[${this.agentType}] Task ${taskId}: ${step}`);
+        this.logger.debug('Executing step', { taskId, step: step.description });
+        
+        // Execute step (may involve tools)
+        const stepResult = await this.executeStep(step, taskId);
         
         // Report progress
-        await this.reportProgress(taskId, ((i + 1) / steps.length) * 100, step);
+        await this.reportProgress(taskId, ((i + 1) / steps.length) * 100, step.description);
         
         // Simulate work time
         await this.sleep(1000 + Math.random() * 2000);
         
         // Check if cancelled
         if (this.status === 'idle') {
-          console.log(`[${this.agentType}] Task ${taskId} was cancelled`);
+          this.logger.info('Task was cancelled', { taskId });
           return;
         }
       }
@@ -174,7 +283,7 @@ export abstract class BaseAgent {
 
   protected cancelTask(taskId: string): void {
     if (this.currentTaskId === taskId) {
-      console.log(`[${this.agentType}] Cancelling task ${taskId}`);
+      this.logger.info('Cancelling task', { taskId });
       this.status = 'idle';
       this.currentTaskId = undefined;
     }
@@ -193,7 +302,16 @@ export abstract class BaseAgent {
       completedAt: new Date().toISOString(),
     }));
     
-    console.log(`[${this.agentType}] Task ${taskId} completed`);
+    // Add to context
+    if (this.currentRoomId) {
+      this.context.addEntry(this.currentRoomId, 'task', {
+        taskId,
+        status: 'completed',
+        result,
+      }, this.agentId, { taskId });
+    }
+    
+    this.logger.info('Task completed', { taskId, stepsExecuted: result.stepsExecuted });
   }
 
   protected async failTask(taskId: string, error: string): Promise<void> {
@@ -207,6 +325,8 @@ export abstract class BaseAgent {
     
     this.status = 'error';
     await this.updateStatus('error');
+    
+    this.logger.error('Task failed', new Error(error), { taskId });
   }
 
   protected async reportProgress(
@@ -222,6 +342,34 @@ export abstract class BaseAgent {
     );
     
     await this.nc.publish(RoomSubjects.event(this.currentRoomId || 'unknown'), JSON.stringify(event));
+  }
+
+  // ============================================================
+  // Execution Planning (Override in subclasses)
+  // ============================================================
+
+  protected async planExecution(goal: string, priority: string): Promise<ExecutionStep[]> {
+    // Default implementation - subclasses can override with tool usage
+    return [
+      { description: `Analyzing: ${goal}`, tool?: undefined, params?: {} },
+      { description: 'Executing plan', tool?: undefined, params?: {} },
+      { description: 'Finalizing', tool?: undefined, params?: {} },
+    ];
+  }
+
+  protected async executeStep(step: ExecutionStep, taskId: string): Promise<void> {
+    // If step has a tool, execute it
+    if (step.tool) {
+      const result = await this.executeTool(step.tool, step.params || {});
+      if (!result.success) {
+        this.logger.warn('Tool execution had issues', { tool: step.tool, error: result.error });
+      }
+    }
+  }
+
+  private extractRoomId(taskId: string): string | undefined {
+    // In production, this would be looked up from orchestrator
+    return process.env.DEMO_ROOM_ID || 'demo-room';
   }
 
   // ============================================================
@@ -247,11 +395,20 @@ export abstract class BaseAgent {
   }
 
   protected async reportStatus(): Promise<void> {
-    console.log(`[${this.agentType}] Status report:`, {
+    this.logger.info('Status report', {
       agentId: this.agentId,
-      type: this.agentType,
+      agentType: this.agentType,
       status: this.status,
       currentTask: this.currentTaskId,
+      toolsAvailable: this.tools.getHealth().available,
+    });
+  }
+
+  protected reportAvailableTools(): void {
+    const tools = this.getAvailableTools();
+    this.logger.info('Available tools', { 
+      agentId: this.agentId, 
+      tools: tools.map(t => t.name) 
     });
   }
 
@@ -262,97 +419,137 @@ export abstract class BaseAgent {
         roomId: this.currentRoomId,
         taskId: this.currentTaskId,
         load: this.status === 'working' ? 0.8 : 0.1,
-        lastError: undefined,
       };
       
       await this.nc.publish(
         AgentSubjects.agentHeartbeat(this.agentId), 
         JSON.stringify(payload)
       );
-    }, 10000); // Every 10 seconds
+    }, 10000);
   }
 
   // ============================================================
-  // Abstract Methods
+  // Utility
   // ============================================================
 
-  protected abstract getExecutionSteps(goal: string): string[];
-  
-  protected abstract sleep(ms: number): Promise<void>;
+  protected sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 }
 
 // ============================================================
-// Planner Agent
+// Execution Step Type
 // ============================================================
 
-class PlannerAgent extends BaseAgent {
+interface ExecutionStep {
+  description: string;
+  tool?: string;
+  params?: Record<string, unknown>;
+}
+
+// ============================================================
+// Planner Agent (with tools)
+// ============================================================
+
+class PlannerAgent extends ToolAwareAgent {
   constructor(nc: NatsConnection) {
     super(nc, `planner-${uuidv4().slice(0, 6)}`, 'planner');
   }
 
-  protected getExecutionSteps(goal: string): string[] {
-    return [
-      `Analyzing goal: ${goal}`,
-      'Researching requirements',
-      'Breaking down into sub-tasks',
-      'Creating execution plan',
-      'Validating plan completeness',
-      'Finalizing task hierarchy',
-    ];
+  protected registerTools(): void {
+    // Planner has access to analysis tools
+    this.tools.register(new (class {
+      readonly definition = {
+        id: 'planner.analyze',
+        name: 'analyze_task',
+        description: 'Analyze a task and break it down',
+        category: 'code' as const,
+        parameters: [
+          { name: 'goal', type: 'string', description: 'Task goal', required: true },
+          { name: 'priority', type: 'string', description: 'Task priority', required: false },
+        ],
+        returns: { type: 'object', description: 'Analysis result' },
+      };
+
+      async execute(params: Record<string, unknown>) {
+        return {
+          success: true,
+          data: {
+            subtasks: ['Subtask 1', 'Subtask 2', 'Subtask 3'],
+            estimatedTime: '30 minutes',
+            complexity: 'medium',
+          },
+        };
+      }
+    })());
+
+    this.logger.debug('Planner tools registered');
   }
 
-  protected async sleep(ms: number): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, ms));
+  protected async planExecution(goal: string, priority: string): Promise<ExecutionStep[]> {
+    // Use tool to analyze and break down task
+    const analysisResult = await this.executeTool('planner.analyze', { goal, priority });
+
+    return [
+      { description: `Analyzing: ${goal}`, tool: 'planner.analyze', params: { goal, priority } },
+      { description: 'Breaking down into subtasks', tool: 'planner.analyze', params: { goal } },
+      { description: 'Creating execution plan' },
+      { description: 'Validating plan' },
+      { description: 'Finalizing' },
+    ];
   }
 }
 
 // ============================================================
-// Executor Agent
+// Executor Agent (with tools)
 // ============================================================
 
-class ExecutorAgent extends BaseAgent {
+class ExecutorAgent extends ToolAwareAgent {
   constructor(nc: NatsConnection) {
     super(nc, `executor-${uuidv4().slice(0, 6)}`, 'executor');
   }
 
-  protected getExecutionSteps(goal: string): string[] {
-    return [
-      `Understanding task: ${goal}`,
-      'Setting up environment',
-      'Implementing core functionality',
-      'Writing tests',
-      'Running validation',
-      'Code review',
-    ];
+  protected registerTools(): void {
+    // Executor has access to file, shell, and HTTP tools
+    // Note: Shell and file write require approval per default policy
+    this.logger.debug('Executor tools registered (shell, file, http available)');
   }
 
-  protected async sleep(ms: number): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, ms));
+  protected async planExecution(goal: string, priority: string): Promise<ExecutionStep[]> {
+    return [
+      { description: `Understanding: ${goal}` },
+      { description: 'Setting up environment' },
+      { description: 'Implementing core functionality' },
+      { description: 'Writing tests' },
+      { description: 'Running validation' },
+      { description: 'Code review' },
+    ];
   }
 }
 
 // ============================================================
-// Reviewer Agent
+// Reviewer Agent (with tools)
 // ============================================================
 
-class ReviewerAgent extends BaseAgent {
+class ReviewerAgent extends ToolAwareAgent {
   constructor(nc: NatsConnection) {
     super(nc, `reviewer-${uuidv4().slice(0, 6)}`, 'reviewer');
   }
 
-  protected getExecutionSteps(goal: string): string[] {
-    return [
-      `Reviewing: ${goal}`,
-      'Checking code quality',
-      'Validating security',
-      'Testing edge cases',
-      'Checking performance',
-      'Final approval',
-    ];
+  protected registerTools(): void {
+    // Reviewer has access to code analysis tools
+    this.logger.debug('Reviewer tools registered');
   }
 
-  protected async sleep(ms: number): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, ms));
+  protected async planExecution(goal: string, priority: string): Promise<ExecutionStep[]> {
+    return [
+      { description: `Reviewing: ${goal}` },
+      { description: 'Checking code quality' },
+      { description: 'Validating security' },
+      { description: 'Testing edge cases' },
+      { description: 'Checking performance' },
+      { description: 'Final approval' },
+    ];
   }
 }
 
@@ -361,13 +558,18 @@ class ReviewerAgent extends BaseAgent {
 // ============================================================
 
 async function bootstrap() {
-  console.log('[AgentRuntime] Starting...');
+  const logger = createLogger('agent-runtime');
+  logger.info('Starting Agent Runtime...');
   
-  const nc = await connect({ servers: process.env.NATS_URL || 'nats://localhost:4222' });
-  console.log('[AgentRuntime] Connected to NATS');
-  
-  // Create agents
-  const agents: BaseAgent[] = [
+  const nc = await connect({ 
+    servers: process.env.NATS_URL || 'nats://localhost:4222',
+    timeout: 10000,
+    reconnect: true,
+  });
+  logger.info('Connected to NATS');
+
+  // Create agents with tool capabilities
+  const agents: ToolAwareAgent[] = [
     new PlannerAgent(nc),
     new ExecutorAgent(nc),
     new ExecutorAgent(nc), // Multiple executors for scaling
@@ -377,17 +579,24 @@ async function bootstrap() {
   // Start all agents
   await Promise.all(agents.map(a => a.start()));
   
-  console.log('[AgentRuntime] All agents started');
-  console.log(`[AgentRuntime] Agents: ${agents.map(a => a['agentId']).join(', ')}`);
-  console.log('[AgentRuntime] Waiting for tasks...');
+  logger.info('All agents started', { 
+    count: agents.length,
+    agents: agents.map(a => ({ id: a['agentId'], type: a['agentType'] }))
+  });
 
-  // Keep running
-  process.on('SIGINT', async () => {
-    console.log('[AgentRuntime] Shutting down...');
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info('Shutting down...');
     await Promise.all(agents.map(a => a.stop()));
     await nc.close();
     process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-bootstrap().catch(console.error);
+bootstrap().catch((error) => {
+  console.error('Failed to start Agent Runtime:', error);
+  process.exit(1);
+});

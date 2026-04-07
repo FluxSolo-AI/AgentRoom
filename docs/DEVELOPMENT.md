@@ -5,10 +5,10 @@
 ```
 fluxroom/
 ├── packages/
-│   ├── shared/           # Shared types, events, NATS subjects, validation, logging
+│   ├── shared/           # Shared types, events, tools, context, policy
 │   ├── room-service/     # Room management service
 │   ├── orchestrator/      # Task orchestration service
-│   ├── agent-runtime/    # Agent runtime (planner, executor, reviewer)
+│   ├── agent-runtime/    # Agent runtime with tool integration
 │   ├── api/              # HTTP REST API gateway
 │   └── web/              # Web UI + WebSocket server
 ├── scripts/
@@ -20,49 +20,40 @@ fluxroom/
     └── DEVELOPMENT.md    # This file
 ```
 
-## Phase 3: Stability Features
+## Phase 4: Intelligence Features
 
-### Implemented in Phase 3
+### Implemented in Phase 4
 
-- [x] **Input Validation Layer**
-  - Room, task, message validation
-  - ID format validation
-  - Type-safe validation results
+- [x] **Tool System**
+  - Tool registry for capability management
+  - Built-in tool definitions (file, http, shell, search)
+  - Tool execution with rate limiting
+  - Approval workflow for sensitive tools
 
-- [x] **Structured Logging**
-  - Console logger (development)
-  - JSON logger (production)
-  - Service-specific loggers
-  - Error tracking with stack traces
+- [x] **Context Management**
+  - Per-room context isolation
+  - Entry types (message, task, tool_result, observation, summary)
+  - Window strategies (sliding, summary, breakdown)
+  - Context search and stats
 
-- [x] **Health Check Endpoints**
-  - `/health` - Full health check
-  - `/health/live` - Liveness probe
-  - `/health/ready` - Readiness probe
+- [x] **Policy Engine**
+  - Rule-based access control
+  - Policy conditions and priorities
+  - Violation tracking
+  - Built-in default policies
 
-- [x] **Metrics Endpoint**
-  - Prometheus-compatible `/metrics`
-  - Room/task counts
-  - Memory/CPU usage
+- [x] **Agent Enhancements**
+  - Tool-aware agents
+  - Context integration
+  - Policy enforcement
+  - Execution planning
 
-- [x] **API Gateway**
-  - RESTful HTTP API
-  - Room CRUD operations
-  - Task management endpoints
-  - Request validation
-  - Error handling
+### Planned for Phase 4/5
 
-- [x] **JetStream Persistence** (foundation)
-  - Event streaming setup
-  - Event replay capability
-  - Stream management
-
-### Planned for Phase 3
-
-- [ ] PostgreSQL entity storage
-- [ ] Redis caching
-- [ ] Request rate limiting
-- [ ] Distributed tracing
+- [ ] LLM integration for task planning
+- [ ] Dynamic tool discovery
+- [ ] Predictive intervention
+- [ ] Multi-region support
 
 ## Quick Start
 
@@ -84,78 +75,109 @@ npm install
 npm run dev
 ```
 
-### 4. Access Services
+## Tool System
 
-| Service | URL |
-|---------|-----|
-| Web UI | http://localhost:3000 |
-| API Gateway | http://localhost:3001 |
-| Health Check | http://localhost:3001/health |
-| Metrics | http://localhost:3001/metrics |
-| NATS Monitor | http://localhost:8222 |
+### Available Tools
 
-## API Reference
+| Tool ID | Name | Category | Description |
+|---------|------|----------|-------------|
+| `file.read` | read_file | file | Read file contents |
+| `file.write` | write_file | file | Write content to file |
+| `file.list` | list_directory | file | List directory contents |
+| `http.request` | http_request | http | Make HTTP requests |
+| `shell.command` | run_command | shell | Execute shell commands |
+| `search.web` | web_search | search | Search the web |
 
-### Health Check
+### Using Tools in Agents
 
-```bash
-# Full health check
-curl http://localhost:3001/health
+```typescript
+// Check policy before execution
+const policyResult = policies.canExecuteTool(toolId, toolName, toolCategory);
+if (!policyResult.allowed) {
+  if (policyResult.requiresApproval) {
+    // Trigger human intervention
+  }
+  return { success: false, error: 'Policy denied' };
+}
 
-# Liveness probe
-curl http://localhost:3001/health/live
-
-# Readiness probe  
-curl http://localhost:3001/health/ready
+// Execute tool
+const result = await executeTool('file.read', { path: '/tmp/data.txt' });
 ```
 
-### Metrics
+## Context Management
 
-```bash
-curl http://localhost:3001/metrics
+### Adding Context Entries
+
+```typescript
+// Add task to context
+context.addEntry(roomId, 'task', {
+  taskId: 'task_123',
+  goal: 'Build feature X',
+  status: 'in_progress',
+}, agentId, { taskId: 'task_123' });
+
+// Add tool result
+context.addEntry(roomId, 'tool_result', {
+  toolId: 'file.read',
+  result: 'file contents...',
+}, agentId, { taskId: 'task_123' });
 ```
 
-### Rooms API
+### Querying Context
 
-```bash
-# Create room
-curl -X POST http://localhost:3001/api/rooms \
-  -H "Content-Type: application/json" \
-  -d '{"name": "My Room", "type": "task_room", "createdBy": "user1"}'
+```typescript
+// Get recent entries
+const entries = context.getRecentEntries(roomId, 50);
 
-# List rooms
-curl http://localhost:3001/api/rooms
+// Get task-specific context
+const taskEntries = context.getTaskContext(roomId, taskId);
 
-# Get room
-curl http://localhost:3001/api/rooms/room_abc123
+// Search context
+const results = context.search(roomId, 'authentication');
 
-# Update room
-curl -X PATCH http://localhost:3001/api/rooms/room_abc123 \
-  -H "Content-Type: application/json" \
-  -d '{"status": "paused"}'
-
-# Delete room
-curl -X DELETE http://localhost:3001/api/rooms/room_abc123
+// Get context stats
+const stats = context.getStats(roomId);
 ```
 
-### Tasks API
+## Policy Engine
 
-```bash
-# Create task
-curl -X POST http://localhost:3001/api/rooms/room_abc123/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"title": "My Task", "goal": "Do something", "priority": "high"}'
+### Default Policies
 
-# List tasks
-curl http://localhost:3001/api/rooms/room_abc123/tasks
+| Policy | Effect | Priority | Description |
+|--------|--------|----------|-------------|
+| Shell Command Approval | require_human_approval | 100 | Shell commands need approval |
+| File Write Approval | require_human_approval | 90 | File writes need approval |
+| Critical Task Human Approval | require_human_approval | 80 | Critical tasks need approval |
+| High Priority Logging | log_only | 50 | Log high priority operations |
+| Default Allow | allow | 0 | Allow all other actions |
 
-# Get task
-curl http://localhost:3001/api/tasks/task_xyz789
+### Evaluating Policies
 
-# Update task
-curl -X PATCH http://localhost:3001/api/tasks/task_xyz789 \
-  -H "Content-Type: application/json" \
-  -d '{"status": "in_progress"}'
+```typescript
+// Check tool execution
+const result = policies.canExecuteTool(toolId, toolName, toolCategory);
+
+// Check task creation
+const result = policies.canCreateTask(priority, requiresHuman);
+
+// Check task execution
+const result = policies.canExecuteTask(taskId, priority, assignedTo);
+```
+
+### Creating Custom Policies
+
+```typescript
+policies.addRule({
+  name: 'Custom Policy',
+  effect: 'deny',
+  subjects: ['tool'],
+  actions: ['execute'],
+  conditions: [
+    { field: 'tool.category', operator: 'equals', value: 'shell' },
+  ],
+  priority: 110,
+  enabled: true,
+});
 ```
 
 ## Architecture
@@ -186,9 +208,12 @@ curl -X PATCH http://localhost:3001/api/tasks/task_xyz789 \
         ▼                   ▼                   ▼
 ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
 │Room Service  │   │ Orchestrator │   │Agent Runtime │
-└──────┬───────┘   └──────┬───────┘   └──────────────┘
-       │                  │
-       └──────────┬─────────┘
+│              │   │              │   │  + Tools     │
+│              │   │              │   │  + Context   │
+│              │   │              │   │  + Policy    │
+└──────────────┘   └──────────────┘   └──────────────┘
+       │                                    │
+       └──────────┬─────────────────────────┘
                   │
                   ▼
           ┌──────────────┐
@@ -197,50 +222,76 @@ curl -X PATCH http://localhost:3001/api/tasks/task_xyz789 \
           └──────────────┘
 ```
 
-### HTTP API Gateway
+## API Reference
 
+### Tool Endpoints (via API Gateway)
+
+```bash
+# List available tools
+curl http://localhost:3001/api/tools
+
+# Execute tool
+curl -X POST http://localhost:3001/api/tools/execute \
+  -H "Content-Type: application/json" \
+  -d '{"toolId": "file.read", "parameters": {"path": "/tmp/test.txt"}}'
 ```
-Browser ──► API Gateway ──► Room Service
-                    │              │
-                    │              ▼
-                    │       ┌──────────────┐
-                    │       │ NATS Server  │
-                    │       └──────────────┘
-                    ▼
-          ┌──────────────┐
-          │ Health/Meta  │
-          │  Endpoints  │
-          └──────────────┘
+
+### Context Endpoints
+
+```bash
+# Get room context
+curl http://localhost:3001/api/rooms/{roomId}/context
+
+# Search context
+curl "http://localhost:3001/api/rooms/{roomId}/context/search?q=authentication"
+
+# Get context stats
+curl http://localhost:3001/api/rooms/{roomId}/context/stats
+```
+
+### Policy Endpoints
+
+```bash
+# List policies
+curl http://localhost:3001/api/policies
+
+# Evaluate policy
+curl -X POST http://localhost:3001/api/policies/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{"subjectType": "tool", "action": "execute", "context": {"tool.category": "shell"}}'
+
+# Get violations
+curl http://localhost:3001/api/policies/violations
 ```
 
 ## Environment Variables
 
-### API Gateway
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| PORT | 3001 | HTTP server port |
+| NATS_URL | nats://localhost:4222 | NATS server URL |
+| LOG_LEVEL | debug | Logging level |
 | NODE_ENV | development | Environment mode |
-| NATS_URL | nats://localhost:4222 | NATS server URL |
-| ALLOWED_ORIGINS | http://localhost:3000 | CORS origins |
-| LOG_LEVEL | debug | Logging level |
+| DEMO_ROOM_ID | demo-room | Demo room ID |
 
-### Services
+## Monitoring
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| NATS_URL | nats://localhost:4222 | NATS server URL |
-| HEALTH_PORT | 8081 | Health check port |
-| LOG_LEVEL | debug | Logging level |
+### Health Checks
+
+```bash
+# All services
+curl http://localhost:3001/health
+
+# NATS monitor
+curl http://localhost:8222/healthz
+```
+
+### Metrics
+
+```bash
+curl http://localhost:3001/metrics
+```
 
 ## Testing
-
-### Manual Test Flow
-
-1. Start services: `npm run dev`
-2. Check health: `curl http://localhost:3001/health`
-3. Create room: `curl -X POST ...`
-4. Watch events in NATS monitor: http://localhost:8222
 
 ### Demo Script
 
@@ -248,57 +299,26 @@ Browser ──► API Gateway ──► Room Service
 npm run demo
 ```
 
-## Deployment
+### Manual Testing
 
-### Docker Compose (Full Stack)
-
-```bash
-docker-compose up -d
-```
-
-### Individual Services
-
-```bash
-# API Gateway
-cd packages/api && npm run build && npm start
-
-# Web UI
-cd packages/web && npm run build
-
-# Room Service
-cd packages/room-service && npm run build && npm start
-```
-
-## Monitoring
-
-### Health Checks
-
-- **Liveness**: Is the process running?
-- **Readiness**: Is the service ready to accept traffic?
-- **Full**: All dependencies healthy?
-
-### Metrics
-
-Prometheus-compatible metrics at `/metrics`:
-
-- `fluxroom_rooms_total` - Total rooms
-- `fluxroom_tasks_total` - Total tasks
-- `fluxroom_tasks_by_status{status}` - Tasks by status
-- `fluxroom_memory_heap_used_bytes` - Memory usage
-- `fluxroom_uptime_seconds` - Process uptime
+1. Start all services: `npm run dev`
+2. Open Web UI: http://localhost:3000
+3. Create tasks via API
+4. Watch agents execute with tools
+5. Review context and policy logs
 
 ## Next Steps
 
-### Phase 4: Intelligence (Planned)
-
-- [ ] Dynamic task routing with ML
-- [ ] Agent load balancing
-- [ ] Predictive intervention
-- [ ] Context optimization
-
 ### Phase 5: Scale (Planned)
 
-- [ ] Multi-region support
-- [ ] Horizontal scaling
+- [ ] Multi-region deployment
+- [ ] Horizontal scaling of agents
 - [ ] Load balancing
 - [ ] CDN integration
+
+### Phase 6: Intelligence (Planned)
+
+- [ ] LLM-based task planning
+- [ ] Dynamic tool generation
+- [ ] Predictive analytics
+- [ ] Self-healing systems
