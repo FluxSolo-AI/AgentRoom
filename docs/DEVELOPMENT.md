@@ -5,23 +5,71 @@
 ```
 fluxroom/
 ├── packages/
-│   ├── shared/           # Shared types, events, NATS subjects
+│   ├── shared/           # Shared types, events, NATS subjects, validation, logging
 │   ├── room-service/     # Room management service
 │   ├── orchestrator/      # Task orchestration service
 │   ├── agent-runtime/    # Agent runtime (planner, executor, reviewer)
+│   ├── api/              # HTTP REST API gateway
 │   └── web/              # Web UI + WebSocket server
-├── docker-compose.yaml   # NATS server
+├── scripts/
+│   ├── demo.ts           # Demo scenario script
+│   └── init-db.sql       # PostgreSQL schema
+├── docker-compose.yaml    # Full stack infrastructure
 └── docs/
     ├── architecture.md   # Full architecture document
-    └── DEVELOPMENT.md     # This file
+    └── DEVELOPMENT.md    # This file
 ```
+
+## Phase 3: Stability Features
+
+### Implemented in Phase 3
+
+- [x] **Input Validation Layer**
+  - Room, task, message validation
+  - ID format validation
+  - Type-safe validation results
+
+- [x] **Structured Logging**
+  - Console logger (development)
+  - JSON logger (production)
+  - Service-specific loggers
+  - Error tracking with stack traces
+
+- [x] **Health Check Endpoints**
+  - `/health` - Full health check
+  - `/health/live` - Liveness probe
+  - `/health/ready` - Readiness probe
+
+- [x] **Metrics Endpoint**
+  - Prometheus-compatible `/metrics`
+  - Room/task counts
+  - Memory/CPU usage
+
+- [x] **API Gateway**
+  - RESTful HTTP API
+  - Room CRUD operations
+  - Task management endpoints
+  - Request validation
+  - Error handling
+
+- [x] **JetStream Persistence** (foundation)
+  - Event streaming setup
+  - Event replay capability
+  - Stream management
+
+### Planned for Phase 3
+
+- [ ] PostgreSQL entity storage
+- [ ] Redis caching
+- [ ] Request rate limiting
+- [ ] Distributed tracing
 
 ## Quick Start
 
-### 1. Start NATS Server
+### 1. Start Infrastructure
 
 ```bash
-docker-compose up -d
+docker-compose up -d nats postgres redis
 ```
 
 ### 2. Install Dependencies
@@ -36,186 +84,221 @@ npm install
 npm run dev
 ```
 
-This will start:
-- Room Service (port: connects to NATS)
-- Orchestrator Service (port: connects to NATS)
-- Agent Runtime (4 agents: planner, executor×2, reviewer)
-- Web UI (http://localhost:3000)
+### 4. Access Services
+
+| Service | URL |
+|---------|-----|
+| Web UI | http://localhost:3000 |
+| API Gateway | http://localhost:3001 |
+| Health Check | http://localhost:3001/health |
+| Metrics | http://localhost:3001/metrics |
+| NATS Monitor | http://localhost:8222 |
+
+## API Reference
+
+### Health Check
+
+```bash
+# Full health check
+curl http://localhost:3001/health
+
+# Liveness probe
+curl http://localhost:3001/health/live
+
+# Readiness probe  
+curl http://localhost:3001/health/ready
+```
+
+### Metrics
+
+```bash
+curl http://localhost:3001/metrics
+```
+
+### Rooms API
+
+```bash
+# Create room
+curl -X POST http://localhost:3001/api/rooms \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Room", "type": "task_room", "createdBy": "user1"}'
+
+# List rooms
+curl http://localhost:3001/api/rooms
+
+# Get room
+curl http://localhost:3001/api/rooms/room_abc123
+
+# Update room
+curl -X PATCH http://localhost:3001/api/rooms/room_abc123 \
+  -H "Content-Type: application/json" \
+  -d '{"status": "paused"}'
+
+# Delete room
+curl -X DELETE http://localhost:3001/api/rooms/room_abc123
+```
+
+### Tasks API
+
+```bash
+# Create task
+curl -X POST http://localhost:3001/api/rooms/room_abc123/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title": "My Task", "goal": "Do something", "priority": "high"}'
+
+# List tasks
+curl http://localhost:3001/api/rooms/room_abc123/tasks
+
+# Get task
+curl http://localhost:3001/api/tasks/task_xyz789
+
+# Update task
+curl -X PATCH http://localhost:3001/api/tasks/task_xyz789 \
+  -H "Content-Type: application/json" \
+  -d '{"status": "in_progress"}'
+```
 
 ## Architecture
 
 ### Service Communication
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  Web UI     │────▶│ NATS Server  │◀────│   Agents    │
-│  (Browser)  │     │              │     │  Runtime    │
-└─────────────┘     └──────────────┘     └─────────────┘
-       │                   ▲
-       │                   │
-       ▼                   │
-┌─────────────┐     ┌──────────────┐
-│  WebSocket │────▶│ Orchestrator │
-│   Server   │     │   Service    │
-└─────────────┘     └──────────────┘
-                           ▲
-                           │
-                    ┌──────────────┐
-                    │ Room Service │
-                    └──────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                         Browser                              │
+└─────────────────┬───────────────────────┬───────────────────┘
+                  │                       │
+                  ▼                       ▼
+          ┌──────────────┐        ┌─────────────┐
+          │   Web UI     │        │  WebSocket  │
+          │  (React)    │        │   Server    │
+          └──────┬───────┘        └──────┬──────┘
+                 │                       │
+                 └───────────┬───────────┘
+                             │
+                             ▼
+                  ┌─────────────────────┐
+                  │   NATS Server      │
+                  │  (Message Bus)     │
+                  └─────────┬───────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│Room Service  │   │ Orchestrator │   │Agent Runtime │
+└──────┬───────┘   └──────┬───────┘   └──────────────┘
+       │                  │
+       └──────────┬─────────┘
+                  │
+                  ▼
+          ┌──────────────┐
+          │ PostgreSQL   │
+          │ (Storage)   │
+          └──────────────┘
 ```
 
-### Event Flow
+### HTTP API Gateway
 
-1. User creates room via Web UI
-2. Room Service publishes `room.created` event
-3. Orchestrator subscribes and creates tasks
-4. Tasks are dispatched to appropriate agents via NATS
-5. Agents execute and publish progress/completion events
-6. WebSocket server broadcasts events to subscribed clients
-7. Web UI updates in real-time
-
-## Implemented Features
-
-### Phase 1: Collaboration Loop ✅
-
-- [x] **Room Model**
-  - Create rooms with type (task_room, incident_room, review_room)
-  - Room status management
-  - Room metadata
-
-- [x] **Participant Management**
-  - Add/remove participants (human, agent, system)
-  - Presence tracking
-
-- [x] **Message Timeline**
-  - Post messages with types
-  - Thread support
-  - Event publishing
-
-- [x] **Task Management**
-  - Create tasks with goals
-  - Task hierarchy (parent/child)
-  - Task status machine
-  - Priority levels
-  - Task assignment
-
-- [x] **Human Intervention**
-  - Request intervention
-  - Intervention status tracking
-  - Auto-timeout support
-
-### Phase 2: Real-time & Agents ✅
-
-- [x] **Agent Runtime**
-  - Base agent class
-  - Planner Agent
-  - Executor Agent
-  - Reviewer Agent
-  - Heartbeat system
-  - Progress reporting
-
-- [x] **WebSocket Server**
-  - Real-time event broadcasting
-  - Room subscriptions
-  - Client reconnection
-
-- [x] **Web UI Enhancements**
-  - Real-time updates via WebSocket
-  - Connection status
-  - Event handlers for all event types
-
-### Phase 3: Stability (Planned)
-
-- [ ] JetStream persistence
-- [ ] Retry and idempotency
-- [ ] Dead letter handling
-- [ ] Task timeout and escalation
-- [ ] Audit log storage
-
-## API Reference
-
-### NATS Subjects
-
-#### Room Events
 ```
-room.{roomId}.message     - Room messages
-room.{roomId}.event       - All room events
-room.{roomId}.task.created - Task creation
-room.{roomId}.task.updated - Task updates
-room.{roomId}.intervention.requested - Human intervention
-```
-
-#### Agent Commands
-```
-agent.{agentType}.command - Broadcast to agent type
-agent.{agentId}.command   - Direct to specific agent
-agent.{agentId}.status    - Agent status updates
-agent.{agentId}.heartbeat - Agent heartbeat
-```
-
-#### Orchestrator
-```
-orchestrator.task.dispatch - Task routing
-orchestrator.task.result  - Task completion
-orchestrator.human.intervention - Human action routing
-```
-
-### WebSocket Messages
-
-#### Client → Server
-```json
-{ "type": "subscribe", "roomId": "room_123" }
-{ "type": "unsubscribe", "roomId": "room_123" }
-{ "type": "ping" }
-```
-
-#### Server → Client
-```json
-{ "type": "event", "subject": "room.room_123.event", "event": {...} }
-{ "type": "subscribed", "roomId": "room_123" }
-{ "type": "pong" }
+Browser ──► API Gateway ──► Room Service
+                    │              │
+                    │              ▼
+                    │       ┌──────────────┐
+                    │       │ NATS Server  │
+                    │       └──────────────┘
+                    ▼
+          ┌──────────────┐
+          │ Health/Meta  │
+          │  Endpoints  │
+          └──────────────┘
 ```
 
 ## Environment Variables
 
+### API Gateway
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| PORT | 3001 | HTTP server port |
+| NODE_ENV | development | Environment mode |
+| NATS_URL | nats://localhost:4222 | NATS server URL |
+| ALLOWED_ORIGINS | http://localhost:3000 | CORS origins |
+| LOG_LEVEL | debug | Logging level |
+
+### Services
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | NATS_URL | nats://localhost:4222 | NATS server URL |
-| WS_PORT | 8080 | WebSocket server port |
-| DEMO_ROOM_ID | demo-room | Demo room ID |
-
-## Running Individual Services
-
-```bash
-# Room Service only
-npm run dev:room
-
-# Orchestrator only
-npm run dev:orch
-
-# Agent Runtime only
-npm run dev:agents
-
-# Web UI only
-npm run dev:web
-```
+| HEALTH_PORT | 8081 | Health check port |
+| LOG_LEVEL | debug | Logging level |
 
 ## Testing
 
 ### Manual Test Flow
 
-1. Start all services: `npm run dev`
-2. Open http://localhost:3000
-3. Create a task in the orchestrator (via API or CLI)
-4. Watch the agent pick up the task
-5. See progress in the Web UI
-6. Approve/reject interventions
+1. Start services: `npm run dev`
+2. Check health: `curl http://localhost:3001/health`
+3. Create room: `curl -X POST ...`
+4. Watch events in NATS monitor: http://localhost:8222
+
+### Demo Script
+
+```bash
+npm run demo
+```
+
+## Deployment
+
+### Docker Compose (Full Stack)
+
+```bash
+docker-compose up -d
+```
+
+### Individual Services
+
+```bash
+# API Gateway
+cd packages/api && npm run build && npm start
+
+# Web UI
+cd packages/web && npm run build
+
+# Room Service
+cd packages/room-service && npm run build && npm start
+```
+
+## Monitoring
+
+### Health Checks
+
+- **Liveness**: Is the process running?
+- **Readiness**: Is the service ready to accept traffic?
+- **Full**: All dependencies healthy?
+
+### Metrics
+
+Prometheus-compatible metrics at `/metrics`:
+
+- `fluxroom_rooms_total` - Total rooms
+- `fluxroom_tasks_total` - Total tasks
+- `fluxroom_tasks_by_status{status}` - Tasks by status
+- `fluxroom_memory_heap_used_bytes` - Memory usage
+- `fluxroom_uptime_seconds` - Process uptime
 
 ## Next Steps
 
-1. **Persistence**: Add JetStream for event replay
-2. **Tool System**: Add tool registration and execution
-3. **Context Service**: Implement context management
-4. **Policy Engine**: Add policy rules and enforcement
-5. **Monitoring**: Add metrics and health checks
+### Phase 4: Intelligence (Planned)
+
+- [ ] Dynamic task routing with ML
+- [ ] Agent load balancing
+- [ ] Predictive intervention
+- [ ] Context optimization
+
+### Phase 5: Scale (Planned)
+
+- [ ] Multi-region support
+- [ ] Horizontal scaling
+- [ ] Load balancing
+- [ ] CDN integration

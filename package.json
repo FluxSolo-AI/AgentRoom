@@ -6,12 +6,13 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run build -w @fluxroom/shared && concurrently \"npm run dev:room\" \"npm run dev:orch\" \"npm run dev:agents\" \"npm run dev:web\"",
+    "dev": "npm run build -w @fluxroom/shared && concurrently \"npm run dev:room\" \"npm run dev:orch\" \"npm run dev:agents\" \"npm run dev:web\" \"npm run dev:api\"",
     "dev:room": "npm run dev -w @fluxroom/room-service",
     "dev:orch": "npm run dev -w @fluxroom/orchestrator",
     "dev:agents": "npm run dev -w @fluxroom/agent-runtime",
     "dev:web": "npm run dev -w @fluxroom/web",
-    "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator && npm run build -w @fluxroom/agent-runtime",
+    "dev:api": "npm run dev -w @fluxroom/api",
+    "build": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/room-service && npm run build -w @fluxroom/orchestrator && npm run build -w @fluxroom/agent-runtime && npm run build -w @fluxroom/api",
     "build:web": "npm run build -w @fluxroom/shared && npm run build -w @fluxroom/web",
     "test": "npm test -w @fluxroom/shared",
     "demo": "tsx scripts/demo.ts",

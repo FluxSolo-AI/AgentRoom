@@ -30,9 +30,18 @@ import {
   RoomSubjects,
   AgentSubjects,
   OrchestratorSubjects,
-  QueueGroups
+  QueueGroups,
+  createLogger,
+  validateTaskInput,
+  validateRoomId,
+  validateTaskId,
+  PersistenceService,
 } from '@fluxroom/shared';
 import { v4 as uuidv4 } from 'uuid';
+
+// ============================================================
+// Types
+// ============================================================
 
 interface OrchestratorConfig {
   maxRetries: number;
@@ -40,19 +49,64 @@ interface OrchestratorConfig {
   humanApprovalThreshold: TaskPriority;
 }
 
+interface TaskCommand {
+  command: string;
+  taskId?: string;
+  goal?: string;
+  priority?: string;
+}
+
+// ============================================================
+// Orchestrator Service
+// ============================================================
+
 export class OrchestratorService {
   private nc: NatsConnection;
   private tasks: Map<string, Task> = new Map();
   private interventions: Map<string, Intervention> = new Map();
   private config: OrchestratorConfig;
+  private logger;
+  private persistence?: PersistenceService;
+  private subscriptions: Msg[] = [];
 
-  constructor(nc: NatsConnection, config?: Partial<OrchestratorConfig>) {
+  constructor(
+    nc: NatsConnection, 
+    config?: Partial<OrchestratorConfig>,
+    options?: { persistence?: PersistenceService }
+  ) {
     this.nc = nc;
     this.config = {
       maxRetries: 3,
       defaultTimeout: 5 * 60 * 1000, // 5 minutes
       humanApprovalThreshold: 'critical',
       ...config,
+    };
+    this.persistence = options?.persistence;
+    this.logger = createLogger('orchestrator');
+  }
+
+  // ============================================================
+  // Health Check
+  // ============================================================
+
+  async healthCheck(): Promise<{
+    status: 'healthy' | 'degraded';
+    uptime: number;
+    activeTasks: number;
+    pendingInterventions: number;
+    persistence: boolean;
+  }> {
+    const activeTasks = Array.from(this.tasks.values())
+      .filter(t => t.status === 'in_progress' || t.status === 'assigned').length;
+    const pendingInterventions = Array.from(this.interventions.values())
+      .filter(i => i.status === 'open').length;
+
+    return {
+      status: 'healthy',
+      uptime: process.uptime(),
+      activeTasks,
+      pendingInterventions,
+      persistence: !!this.persistence,
     };
   }
 
@@ -72,7 +126,28 @@ export class OrchestratorService {
       requiresHuman?: boolean;
       deadlineAt?: string;
     }
-  ): Promise<Task> {
+  ): Promise<{ task?: Task; error?: string }> {
+    // Validate input
+    const validation = validateTaskInput({ title, goal, priority: options?.priority });
+    if (!validation.valid) {
+      this.logger.warn('Invalid task input', { errors: validation.errors });
+      return { error: validation.errors.join(', ') };
+    }
+
+    // Validate room ID
+    const roomValidation = validateRoomId(roomId);
+    if (!roomValidation.valid) {
+      return { error: roomValidation.errors.join(', ') };
+    }
+
+    // Validate parent task if provided
+    if (options?.parentTaskId) {
+      const parentValidation = validateTaskId(options.parentTaskId);
+      if (!parentValidation.valid) {
+        return { error: parentValidation.errors.join(', ') };
+      }
+    }
+
     const task: Task = {
       id: `task_${uuidv4().slice(0, 8)}`,
       roomId,
@@ -92,10 +167,18 @@ export class OrchestratorService {
 
     this.tasks.set(task.id, task);
 
-    // Publish task.created event
+    // Create and publish event
     const event = createEventEnvelope<TaskCreatedPayload>(
       'task.created',
-      { title, goal, parentTaskId: task.parentTaskId, assignedTo: task.assignedTo, assignedAgentType: task.assignedAgentType, priority: task.priority, requiresHuman: task.requiresHuman },
+      { 
+        title, 
+        goal, 
+        parentTaskId: task.parentTaskId, 
+        assignedTo: task.assignedTo, 
+        assignedAgentType: task.assignedAgentType, 
+        priority: task.priority, 
+        requiresHuman: task.requiresHuman 
+      },
       { id: 'orchestrator', type: 'system', name: 'Orchestrator' },
       { roomId, taskId: task.id, traceId: task.traceId }
     );
@@ -103,23 +186,38 @@ export class OrchestratorService {
     await this.nc.publish(RoomSubjects.taskCreated(roomId), JSON.stringify(event));
     await this.nc.publish(OrchestratorSubjects.taskDispatch, JSON.stringify(event));
 
-    console.log(`[Orchestrator] Task created: ${task.id} (${title}) in room ${roomId}`);
+    if (this.persistence) {
+      await this.persistence.publishEvent(RoomSubjects.taskCreated(roomId), event);
+    }
 
-    // Auto-assign if no agent specified
-    if (!task.assignedTo && !task.assignedAgentType && task.assignedTo !== 'human') {
+    this.logger.info('Task created', { 
+      taskId: task.id, 
+      roomId, 
+      title, 
+      priority: task.priority,
+      requiresHuman: task.requiresHuman 
+    });
+
+    // Auto-assign if agent specified
+    if (!task.assignedTo && !task.assignedAgentType && !task.requiresHuman) {
       await this.routeTask(task.id);
     }
 
-    return task;
+    return { task };
   }
 
   async getTask(taskId: string): Promise<Task | undefined> {
     return this.tasks.get(taskId);
   }
 
-  async updateTaskStatus(taskId: string, status: TaskStatus): Promise<Task | undefined> {
+  async updateTaskStatus(
+    taskId: string, 
+    status: TaskStatus
+  ): Promise<{ task?: Task; error?: string }> {
     const task = this.tasks.get(taskId);
-    if (!task) return undefined;
+    if (!task) {
+      return { error: 'Task not found' };
+    }
 
     task.status = status;
     task.updatedAt = new Date().toISOString();
@@ -129,12 +227,20 @@ export class OrchestratorService {
     }
 
     this.tasks.set(taskId, task);
-    return task;
+    
+    this.logger.info('Task status updated', { taskId, status });
+    return { task };
   }
 
-  async assignTask(taskId: string, agentId: string, agentType?: string): Promise<Task | undefined> {
+  async assignTask(
+    taskId: string, 
+    agentId: string, 
+    agentType?: string
+  ): Promise<{ task?: Task; error?: string }> {
     const task = this.tasks.get(taskId);
-    if (!task) return undefined;
+    if (!task) {
+      return { error: 'Task not found' };
+    }
 
     task.assignedTo = agentId;
     task.assignedAgentType = agentType || task.assignedAgentType;
@@ -143,7 +249,7 @@ export class OrchestratorService {
 
     this.tasks.set(taskId, task);
 
-    // Publish task.assigned event
+    // Publish event
     const event = createEventEnvelope<TaskAssignedPayload>(
       'task.assigned',
       { taskId, assignedTo: agentId, assignedAgentType: agentType },
@@ -161,18 +267,36 @@ export class OrchestratorService {
       priority: task.priority,
     };
 
-    if (agentType) {
-      await this.nc.publish(AgentSubjects.command(agentType), JSON.stringify(command));
-    } else {
-      await this.nc.publish(AgentSubjects.agentCommand(agentId), JSON.stringify(command));
-    }
+    const subject = agentType 
+      ? AgentSubjects.command(agentType) 
+      : AgentSubjects.agentCommand(agentId);
+    
+    await this.nc.publish(subject, JSON.stringify(command));
 
-    console.log(`[Orchestrator] Task ${taskId} assigned to ${agentId} (${agentType || 'direct'})`);
-    return task;
+    this.logger.info('Task assigned', { taskId, agentId, agentType });
+    return { task };
   }
 
   async getTasksByRoom(roomId: string): Promise<Task[]> {
     return Array.from(this.tasks.values()).filter(t => t.roomId === roomId);
+  }
+
+  async getActiveTasks(): Promise<Task[]> {
+    return Array.from(this.tasks.values())
+      .filter(t => t.status === 'in_progress' || t.status === 'assigned');
+  }
+
+  async cancelTask(taskId: string): Promise<{ success: boolean; error?: string }> {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+
+    task.status = 'cancelled';
+    task.updatedAt = new Date().toISOString();
+
+    this.logger.info('Task cancelled', { taskId });
+    return { success: true };
   }
 
   // ============================================================
@@ -197,7 +321,6 @@ export class OrchestratorService {
     }
 
     if (targetAgentType === 'human') {
-      // Request human intervention
       await this.requestIntervention(task.roomId, 'approve', task.id, 'Task requires human approval');
     } else {
       await this.assignTask(taskId, `${targetAgentType}-01`, targetAgentType);
@@ -213,7 +336,7 @@ export class OrchestratorService {
     interventionType: InterventionType,
     taskId?: string,
     reason?: string
-  ): Promise<Intervention> {
+  ): Promise<{ intervention?: Intervention; error?: string }> {
     const intervention: Intervention = {
       id: `intv_${uuidv4().slice(0, 8)}`,
       roomId,
@@ -230,10 +353,14 @@ export class OrchestratorService {
 
     // Update task status if linked
     if (taskId) {
-      await this.updateTaskStatus(taskId, 'waiting_human');
+      const task = this.tasks.get(taskId);
+      if (task) {
+        task.status = 'waiting_human';
+        task.updatedAt = new Date().toISOString();
+      }
     }
 
-    // Publish intervention.requested event
+    // Create and publish event
     const event = createEventEnvelope<InterventionRequestedPayload>(
       'intervention.requested',
       { interventionType, taskId, reason: reason || '', timeoutAt: intervention.timeoutAt },
@@ -244,8 +371,18 @@ export class OrchestratorService {
     await this.nc.publish(RoomSubjects.interventionRequested(roomId), JSON.stringify(event));
     await this.nc.publish(OrchestratorSubjects.humanIntervention, JSON.stringify(event));
 
-    console.log(`[Orchestrator] Intervention requested: ${intervention.id} (${interventionType}) for task ${taskId}`);
-    return intervention;
+    if (this.persistence) {
+      await this.persistence.publishEvent(RoomSubjects.interventionRequested(roomId), event);
+    }
+
+    this.logger.warn('Intervention requested', { 
+      interventionId: intervention.id, 
+      interventionType, 
+      taskId, 
+      reason 
+    });
+    
+    return { intervention };
   }
 
   async resolveIntervention(
@@ -254,9 +391,11 @@ export class OrchestratorService {
     action: 'approve' | 'reject' | 'takeover',
     resumePolicy?: Intervention['resumePolicy'],
     message?: string
-  ): Promise<Intervention | undefined> {
+  ): Promise<{ intervention?: Intervention; error?: string }> {
     const intervention = this.interventions.get(interventionId);
-    if (!intervention) return undefined;
+    if (!intervention) {
+      return { error: 'Intervention not found' };
+    }
 
     intervention.resolvedBy = resolvedBy;
     intervention.status = action === 'reject' ? 'rejected' : 'resolved';
@@ -278,11 +417,11 @@ export class OrchestratorService {
         } else if (action === 'reject') {
           task.status = 'blocked';
         }
-        this.tasks.set(task.id, task);
+        task.updatedAt = new Date().toISOString();
       }
     }
 
-    // Publish intervention.resolved event
+    // Publish event
     const event = createEventEnvelope<InterventionResolvedPayload>(
       'intervention.resolved',
       { interventionType: intervention.interventionType, resolvedBy, resumePolicy, message },
@@ -292,8 +431,13 @@ export class OrchestratorService {
 
     await this.nc.publish(RoomSubjects.interventionResolved(intervention.roomId), JSON.stringify(event));
 
-    console.log(`[Orchestrator] Intervention resolved: ${intervention.id} by ${resolvedBy} (${action})`);
-    return intervention;
+    this.logger.info('Intervention resolved', { 
+      interventionId, 
+      resolvedBy, 
+      action 
+    });
+    
+    return { intervention };
   }
 
   async getIntervention(interventionId: string): Promise<Intervention | undefined> {
@@ -309,6 +453,35 @@ export class OrchestratorService {
   }
 
   // ============================================================
+  // Event Handlers
+  // ============================================================
+
+  setupEventHandlers(): void {
+    // Handle task completion from agents
+    const sub = this.nc.subscribe(OrchestratorSubjects.taskResult, { 
+      queue: QueueGroups.orchestrator 
+    });
+    
+    this.subscriptions.push(sub);
+
+    (async () => {
+      for await (const msg of sub) {
+        try {
+          const data = JSON.parse(msg.data.toString());
+          const { taskId, result, status } = data;
+
+          if (taskId) {
+            await this.updateTaskStatus(taskId, status || 'completed');
+            this.logger.info('Task completed', { taskId, result });
+          }
+        } catch (error) {
+          this.logger.error('Failed to handle task result', error as Error);
+        }
+      }
+    })();
+  }
+
+  // ============================================================
   // Policy Helpers
   // ============================================================
 
@@ -321,25 +494,17 @@ export class OrchestratorService {
   }
 
   // ============================================================
-  // Event Handlers
+  // Graceful Shutdown
   // ============================================================
 
-  setupEventHandlers(): void {
-    // Handle task completion from agents
-    this.nc.subscribe(OrchestratorSubjects.taskResult, { queue: QueueGroups.orchestrator }, async (msg: Msg) => {
-      try {
-        const data = JSON.parse(msg.data.toString());
-        const { taskId, result, status } = data;
-
-        const task = this.tasks.get(taskId);
-        if (task) {
-          await this.updateTaskStatus(taskId, status || 'completed');
-          console.log(`[Orchestrator] Task ${taskId} completed with result:`, result);
-        }
-      } catch (e) {
-        console.error('[Orchestrator] Failed to handle task result:', e);
-      }
-    });
+  async shutdown(): Promise<void> {
+    this.logger.info('Shutting down...');
+    
+    for (const sub of this.subscriptions) {
+      sub.unsubscribe();
+    }
+    
+    this.logger.info('Shutdown complete');
   }
 }
 
@@ -348,10 +513,16 @@ export class OrchestratorService {
 // ============================================================
 
 async function bootstrap() {
-  console.log('[Orchestrator] Starting...');
+  const logger = createLogger('orchestrator');
+  logger.info('Starting Orchestrator Service...');
 
-  const nc = await connect({ servers: process.env.NATS_URL || 'nats://localhost:4222' });
-  console.log('[Orchestrator] Connected to NATS');
+  const nc = await connect({ 
+    servers: process.env.NATS_URL || 'nats://localhost:4222',
+    timeout: 10000,
+    reconnect: true,
+    maxReconnectAttempts: 10,
+  });
+  logger.info('Connected to NATS');
 
   const orchestrator = new OrchestratorService(nc, {
     maxRetries: 3,
@@ -364,28 +535,35 @@ async function bootstrap() {
   // Create demo tasks
   const demoRoomId = process.env.DEMO_ROOM_ID || 'demo-room';
   
-  const task1 = await orchestrator.createTask(
+  await orchestrator.createTask(
     demoRoomId,
     'Analyze requirements',
     'Analyze the user requirements and create a detailed plan',
     { assignedAgentType: 'planner', priority: 'high' }
   );
 
-  const task2 = await orchestrator.createTask(
+  await orchestrator.createTask(
     demoRoomId,
     'Critical decision required',
     'This task requires human approval due to high priority',
     { priority: 'critical' }
   );
 
-  console.log('[Orchestrator] Demo tasks created');
-  console.log('[Orchestrator] Waiting for events...');
+  logger.info('Demo tasks created');
 
-  process.on('SIGINT', async () => {
-    console.log('[Orchestrator] Shutting down...');
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info('Received shutdown signal...');
+    await orchestrator.shutdown();
     await nc.close();
     process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-bootstrap().catch(console.error);
+bootstrap().catch((error) => {
+  console.error('Failed to start Orchestrator Service:', error);
+  process.exit(1);
+});

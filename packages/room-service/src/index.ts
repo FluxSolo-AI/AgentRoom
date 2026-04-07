@@ -12,8 +12,6 @@ import {
   connect, 
   NatsConnection, 
   JetStreamClient,
-  consumerOpts,
-  createInbox 
 } from 'nats';
 import { 
   Room, 
@@ -29,20 +27,52 @@ import {
   MessagePostedPayload,
   RoomSubjects,
   SystemSubjects,
-  QueueGroups
+  QueueGroups,
+  createLogger,
+  validateRoomInput,
+  validateRoomId,
+  ValidationResult,
+  PersistenceService,
 } from '@fluxroom/shared';
 import { v4 as uuidv4 } from 'uuid';
+
+// ============================================================
+// Room Service
+// ============================================================
 
 export class RoomService {
   private nc: NatsConnection;
   private js: JetStreamClient;
+  private persistence?: PersistenceService;
   private rooms: Map<string, Room> = new Map();
-  private participants: Map<string, Map<string, Participant>> = new Map(); // roomId -> participantId -> participant
-  private messages: Map<string, RoomMessage[]> = new Map(); // roomId -> messages
+  private participants: Map<string, Map<string, Participant>> = new Map();
+  private messages: Map<string, RoomMessage[]> = new Map();
+  private logger;
+  private shutdownHandlers: (() => Promise<void>)[] = [];
 
-  constructor(nc: NatsConnection) {
+  constructor(nc: NatsConnection, options?: { persistence?: PersistenceService }) {
     this.nc = nc;
     this.js = nc.jetstream();
+    this.persistence = options?.persistence;
+    this.logger = createLogger('room-service');
+  }
+
+  // ============================================================
+  // Health Check
+  // ============================================================
+
+  async healthCheck(): Promise<{
+    status: 'healthy' | 'degraded';
+    uptime: number;
+    rooms: number;
+    persistence: boolean;
+  }> {
+    return {
+      status: 'healthy',
+      uptime: process.uptime(),
+      rooms: this.rooms.size,
+      persistence: !!this.persistence,
+    };
   }
 
   // ============================================================
@@ -54,9 +84,17 @@ export class RoomService {
     type: RoomType,
     createdBy: string,
     policyId?: string
-  ): Promise<Room> {
+  ): Promise<{ room?: Room; error?: string }> {
+    // Validate input
+    const validation = validateRoomInput({ name, type, createdBy, policyId });
+    if (!validation.valid) {
+      this.logger.warn('Invalid room input', { errors: validation.errors });
+      return { error: validation.errors.join(', ') };
+    }
+
+    const roomId = `room_${uuidv4().slice(0, 8)}`;
     const room: Room = {
-      id: `room_${uuidv4().slice(0, 8)}`,
+      id: roomId,
       name,
       type,
       status: 'active',
@@ -70,7 +108,7 @@ export class RoomService {
     this.participants.set(room.id, new Map());
     this.messages.set(room.id, []);
 
-    // Publish room.created event
+    // Create event envelope
     const event = createEventEnvelope<RoomCreatedPayload>(
       'room.created',
       { name, type, createdBy, policyId },
@@ -78,30 +116,70 @@ export class RoomService {
       { roomId: room.id, traceId: `trace_${Date.now()}` }
     );
 
+    // Publish to NATS
     await this.nc.publish(SystemSubjects.roomCreated, JSON.stringify(event));
     await this.nc.publish(RoomSubjects.event(room.id), JSON.stringify(event));
 
-    console.log(`[RoomService] Room created: ${room.id} (${name})`);
-    return room;
+    // Persist if available
+    if (this.persistence) {
+      await this.persistence.publishEvent(RoomSubjects.event(room.id), event);
+    }
+
+    this.logger.info('Room created', { roomId, name, type, createdBy });
+    return { room };
   }
 
   async getRoom(roomId: string): Promise<Room | undefined> {
+    const validation = validateRoomId(roomId);
+    if (!validation.valid) {
+      this.logger.warn('Invalid room ID', { roomId, error: validation.errors });
+      return undefined;
+    }
     return this.rooms.get(roomId);
   }
 
-  async updateRoomStatus(roomId: string, status: RoomStatus): Promise<Room | undefined> {
+  async updateRoomStatus(
+    roomId: string, 
+    status: RoomStatus
+  ): Promise<{ room?: Room; error?: string }> {
+    const validation = validateRoomId(roomId);
+    if (!validation.valid) {
+      return { error: validation.errors.join(', ') };
+    }
+
     const room = this.rooms.get(roomId);
-    if (!room) return undefined;
+    if (!room) {
+      return { error: 'Room not found' };
+    }
 
     room.status = status;
     room.updatedAt = new Date().toISOString();
     this.rooms.set(roomId, room);
 
-    return room;
+    this.logger.info('Room status updated', { roomId, status });
+    return { room };
   }
 
   async listRooms(): Promise<Room[]> {
     return Array.from(this.rooms.values());
+  }
+
+  async deleteRoom(roomId: string): Promise<{ success: boolean; error?: string }> {
+    const validation = validateRoomId(roomId);
+    if (!validation.valid) {
+      return { success: false, error: validation.errors.join(', ') };
+    }
+
+    if (!this.rooms.has(roomId)) {
+      return { success: false, error: 'Room not found' };
+    }
+
+    this.rooms.delete(roomId);
+    this.participants.delete(roomId);
+    this.messages.delete(roomId);
+
+    this.logger.info('Room deleted', { roomId });
+    return { success: true };
   }
 
   // ============================================================
@@ -114,9 +192,17 @@ export class RoomService {
     displayName: string,
     role: string,
     runtimeRef?: string
-  ): Promise<Participant | undefined> {
+  ): Promise<{ participant?: Participant; error?: string }> {
+    // Validate inputs
+    const roomValidation = validateRoomId(roomId);
+    if (!roomValidation.valid) {
+      return { error: roomValidation.errors.join(', ') };
+    }
+
     const room = this.rooms.get(roomId);
-    if (!room) return undefined;
+    if (!room) {
+      return { error: 'Room not found' };
+    }
 
     const participant: Participant = {
       id: `p_${uuidv4().slice(0, 8)}`,
@@ -132,7 +218,7 @@ export class RoomService {
     const roomParticipants = this.participants.get(roomId)!;
     roomParticipants.set(participant.id, participant);
 
-    // Publish participant.joined event
+    // Publish event
     const event = createEventEnvelope(
       'participant.joined',
       { participant },
@@ -142,20 +228,42 @@ export class RoomService {
 
     await this.nc.publish(RoomSubjects.participantJoined(roomId), JSON.stringify(event));
 
-    console.log(`[RoomService] Participant joined: ${participant.id} (${displayName}) in room ${roomId}`);
-    return participant;
+    if (this.persistence) {
+      await this.persistence.publishEvent(RoomSubjects.participantJoined(roomId), event);
+    }
+
+    this.logger.info('Participant joined', { 
+      roomId, 
+      participantId: participant.id, 
+      displayName,
+      participantType 
+    });
+    
+    return { participant };
   }
 
-  async removeParticipant(roomId: string, participantId: string): Promise<boolean> {
+  async removeParticipant(
+    roomId: string, 
+    participantId: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const roomValidation = validateRoomId(roomId);
+    if (!roomValidation.valid) {
+      return { success: false, error: roomValidation.errors.join(', ') };
+    }
+
     const roomParticipants = this.participants.get(roomId);
-    if (!roomParticipants) return false;
+    if (!roomParticipants) {
+      return { success: false, error: 'Room not found' };
+    }
 
     const participant = roomParticipants.get(participantId);
-    if (!participant) return false;
+    if (!participant) {
+      return { success: false, error: 'Participant not found' };
+    }
 
     roomParticipants.delete(participantId);
 
-    // Publish participant.left event
+    // Publish event
     const event = createEventEnvelope(
       'participant.left',
       { participantId },
@@ -165,7 +273,8 @@ export class RoomService {
 
     await this.nc.publish(RoomSubjects.participantLeft(roomId), JSON.stringify(event));
 
-    return true;
+    this.logger.info('Participant left', { roomId, participantId });
+    return { success: true };
   }
 
   async getParticipants(roomId: string): Promise<Participant[]> {
@@ -185,6 +294,7 @@ export class RoomService {
     if (!participant) return false;
 
     participant.presenceStatus = status;
+    this.logger.debug('Participant status updated', { roomId, participantId, status });
     return true;
   }
 
@@ -201,9 +311,11 @@ export class RoomService {
     messageType: MessageType = 'text',
     threadId?: string,
     replyTo?: string
-  ): Promise<RoomMessage | undefined> {
+  ): Promise<{ message?: RoomMessage; error?: string }> {
     const room = this.rooms.get(roomId);
-    if (!room) return undefined;
+    if (!room) {
+      return { error: 'Room not found' };
+    }
 
     const message: RoomMessage = {
       id: `msg_${uuidv4().slice(0, 12)}`,
@@ -222,7 +334,12 @@ export class RoomService {
     const roomMessages = this.messages.get(roomId)!;
     roomMessages.push(message);
 
-    // Publish message.posted event
+    // Limit message history
+    if (roomMessages.length > 10000) {
+      roomMessages.splice(0, roomMessages.length - 10000);
+    }
+
+    // Publish event
     const event = createEventEnvelope<MessagePostedPayload>(
       'message.posted',
       { messageType, content, threadId, replyTo },
@@ -233,7 +350,11 @@ export class RoomService {
     await this.nc.publish(RoomSubjects.message(roomId), JSON.stringify(event));
     await this.nc.publish(RoomSubjects.event(roomId), JSON.stringify(event));
 
-    return message;
+    if (this.persistence) {
+      await this.persistence.publishEvent(RoomSubjects.event(roomId), event);
+    }
+
+    return { message };
   }
 
   async getMessages(roomId: string, limit = 100, before?: string): Promise<RoomMessage[]> {
@@ -252,24 +373,23 @@ export class RoomService {
   // Event Subscription
   // ============================================================
 
-  async subscribeToRoomEvents(roomId: string, handler: (event: EventEnvelope) => void): Promise<() => void> {
+  async subscribeToRoomEvents(
+    roomId: string, 
+    handler: (event: EventEnvelope) => void
+  ): Promise<() => void> {
     const sub = await this.nc.subscribe(
       RoomSubjects.event(roomId),
       { queue: QueueGroups.roomService }
     );
 
-    const handlerFn = (msg: any) => {
-      try {
-        const event = JSON.parse(msg.data.toString());
-        handler(event);
-      } catch (e) {
-        console.error('[RoomService] Failed to parse event:', e);
-      }
-    };
-
     (async () => {
       for await (const msg of sub) {
-        handlerFn(msg);
+        try {
+          const event = JSON.parse(msg.data.toString());
+          handler(event);
+        } catch (error) {
+          this.logger.error('Failed to parse event', error as Error, { roomId });
+        }
       }
     })();
 
@@ -284,12 +404,35 @@ export class RoomService {
     room: Room | undefined;
     participants: Participant[];
     recentMessages: RoomMessage[];
-  }> {
+  } | { error: string }> {
+    const validation = validateRoomId(roomId);
+    if (!validation.valid) {
+      return { error: validation.errors.join(', ') };
+    }
+
     const room = this.rooms.get(roomId);
+    if (!room) {
+      return { error: 'Room not found' };
+    }
+
     const participants = await this.getParticipants(roomId);
     const recentMessages = await this.getMessages(roomId, 50);
 
     return { room, participants, recentMessages };
+  }
+
+  // ============================================================
+  // Graceful Shutdown
+  // ============================================================
+
+  async shutdown(): Promise<void> {
+    this.logger.info('Shutting down...');
+    
+    for (const handler of this.shutdownHandlers) {
+      await handler();
+    }
+    
+    this.logger.info('Shutdown complete');
   }
 }
 
@@ -298,48 +441,62 @@ export class RoomService {
 // ============================================================
 
 async function bootstrap() {
-  console.log('[RoomService] Starting...');
-  
-  const nc = await connect({ servers: process.env.NATS_URL || 'nats://localhost:4222' });
-  console.log('[RoomService] Connected to NATS');
-  
+  const logger = createLogger('room-service');
+  logger.info('Starting Room Service...');
+
+  const nc = await connect({ 
+    servers: process.env.NATS_URL || 'nats://localhost:4222',
+    timeout: 10000,
+    reconnect: true,
+    maxReconnectAttempts: 10,
+  });
+  logger.info('Connected to NATS');
+
   const roomService = new RoomService(nc);
 
-  // Create a demo room for testing
-  const demoRoom = await roomService.createRoom(
+  // Health check endpoint (for monitoring)
+  const healthPort = Number(process.env.HEALTH_PORT) || 8081;
+  
+  // Create demo room
+  const result = await roomService.createRoom(
     'Demo Room',
     'task_room',
     'system',
     undefined
   );
 
-  console.log(`[RoomService] Demo room created: ${demoRoom.id}`);
-  
-  // Add demo participants
-  await roomService.addParticipant(demoRoom.id, 'agent', 'Planner Agent', 'planner', 'planner-01');
-  await roomService.addParticipant(demoRoom.id, 'agent', 'Executor Agent', 'executor', 'executor-01');
-  await roomService.addParticipant(demoRoom.id, 'human', 'Demo User', 'owner');
+  if (result.room) {
+    logger.info('Demo room created', { roomId: result.room.id });
+    
+    await roomService.addParticipant(result.room.id, 'agent', 'Planner Agent', 'planner', 'planner-01');
+    await roomService.addParticipant(result.room.id, 'agent', 'Executor Agent', 'executor', 'executor-01');
+    await roomService.addParticipant(result.room.id, 'human', 'Demo User', 'owner');
 
-  // Post welcome message
-  await roomService.postMessage(
-    demoRoom.id,
-    'room-service',
-    'system',
-    'Room Service',
-    `Welcome to ${demoRoom.name}! This is a demo room for testing.`,
-    'system'
-  );
+    await roomService.postMessage(
+      result.room.id,
+      'room-service',
+      'system',
+      'Room Service',
+      `Welcome! This is a demo room.`,
+      'system'
+    );
+  }
 
-  console.log('[RoomService] Demo room initialized');
-  console.log(`[RoomService] Room ID: ${demoRoom.id}`);
-  console.log('[RoomService] Waiting for events...');
+  logger.info('Room Service ready', { roomId: result.room?.id });
 
-  // Keep the service running
-  process.on('SIGINT', async () => {
-    console.log('[RoomService] Shutting down...');
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info('Received shutdown signal...');
+    await roomService.shutdown();
     await nc.close();
     process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-bootstrap().catch(console.error);
+bootstrap().catch((error) => {
+  console.error('Failed to start Room Service:', error);
+  process.exit(1);
+});
